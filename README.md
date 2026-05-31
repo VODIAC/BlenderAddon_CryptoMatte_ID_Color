@@ -2,7 +2,7 @@
 
 <br>
 
-# CryptoMatte ID Color
+# 🎨 CryptoMatte ID Color
 
 A lightweight Blender add-on that generates real-time ID color compositor node groups from Cryptomatte, making object and material mask colors easier to create, preview, adjust, and export.
 
@@ -16,32 +16,32 @@ A lightweight Blender add-on that generates real-time ID color compositor node g
 
 </div>
 
-## What it does
+## ✨ What it does
 
 **CryptoMatte ID Color** helps you turn Blender Cryptomatte data into clean, editable ID color outputs. Create Object ID or Material ID compositor node groups, assign clear colors, preview the result through the Viewer, and optionally export multilayer EXR masks for later compositing.
 
 ---
 
-## Key Features
+## ⚡ Key Features
 
 - **Object ID node group**: generate color-coded IDs for visible renderable objects.
 - **Material ID node group**: create material-based ID color outputs from visible scene materials.
-- **Real-time color editing**: select one object and adjust its ID color directly.
-- **Random ID colors**: quickly reshuffle existing ID colors for better separation.
-- **Viewer-ready setup**: connects generated ID output to Blender's compositor Viewer.
-- **Multilayer EXR export**: optionally write Object ID or Material ID layers to EXR.
+- **Real-time color editing**: pick one object and adjust its ID color directly.
+- **Random ID colors**: reshuffle existing ID colors when the scene needs clearer separation.
+- **Viewer-ready setup**: connect generated ID output to Blender's compositor Viewer.
+- **Multilayer EXR export**: write Object ID or Material ID layers to EXR when needed.
 - **Shortcut support**: use quick hotkeys for Object ID, Material ID, Change ID, and Random ID.
-- **Chinese / English support**: smoother experience in both language modes.
+- **Chinese / English support**: a smoother workflow in both language modes.
 
 ---
 
-## Demo
+## 🎬 Demo
 
 [<video src="https://github.com/VODIAC/BlenderAddon_CryptoMatte_ID_Color/raw/main/demo/demo.mp4" controls width="100%">](https://github.com/user-attachments/assets/f186ce1d-ebf3-4f45-8377-32fc3b20f146)</video>
 
 ---
 
-## Preview
+## 🖼️ Preview
 
 ## - Main interface
 
@@ -61,7 +61,7 @@ A lightweight Blender add-on that generates real-time ID color compositor node g
 
 ---
 
-## Installation
+## 📦 Installation
 
 ### From Blender Extensions
 
@@ -79,7 +79,7 @@ A lightweight Blender add-on that generates real-time ID color compositor node g
 
 ---
 
-## Basic Workflow
+## 🚀 Basic Workflow
 
 1. Enable **CryptoMatte ID Color** in Blender.
 2. Open the Compositor and find the panel in **Sidebar > Tool**.
@@ -89,13 +89,13 @@ A lightweight Blender add-on that generates real-time ID color compositor node g
 
 ---
 
-## Compatibility
+## ✅ Compatibility
 
 **Blender 4.5 and newer**
 
 ---
 
-## Author
+## 👤 Author
 
 Created by **61+**.
 
