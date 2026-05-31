@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+blender_version_min = "4.5.0"
+version = "1.0.4"
+id = "CryptoMatte_ID_Color"
+name = "CryptoMatte ID Color"
+tagline = "Generate real time ID color compositor nodes using Cryptomatte"
+license = ["SPDX:GPL-3.0-or-later"]
+maintainer = "61+"
+type = "add-on"
+website = "https://github.com/VODIAC/BlenderAddon_CryptoMatte_ID_Color"
+copyright = ["2026 61+"]
+tags = ["Compositing"]
