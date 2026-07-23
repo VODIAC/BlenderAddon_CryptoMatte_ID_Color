@@ -1,7 +1,7 @@
 bl_info = {
     "name": "CryptoMatte ID Color",
     "author": "61+",
-    "version": (1, 1, 0),
+    "version": (1, 1, 1),
     "blender": (4, 5, 0),
     "location": "Compositor > Sidebar > Tool",
     "description": "Generate real-time ID color compositor nodes using Cryptomatte.",
@@ -10,22 +10,29 @@ bl_info = {
 
 import base64
 import colorsys
+import gc
 import glob
+import json
 import os
 import random
+import shutil
 import struct
+import tempfile
 import time
+import traceback
 import zlib
 
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, FloatVectorProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, StringProperty
 from bpy.types import AddonPreferences, Operator, Panel
 from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Vector
 import numpy as np
 import OpenImageIO as oiio
 import PyOpenColorIO as ocio
+
+from .translation import TRANSLATIONS
 
 
 # --- Add-on constants and runtime state ---
@@ -44,18 +51,38 @@ SET_ALPHA_Y_OFFSET = 19
 ALPHA_OVER_Y_OFFSET = 105
 OBJECT_GROUP_OFFSET = (513, 4)
 MATERIAL_GROUP_OFFSET = (315, -98)
+OBJECT_ROUTE_OFFSETS = {
+    "REROUTE": (250.008, -32.355),
+    "VIEWER": (377.460, 1.353),
+    "GROUP_OUTPUT": (377.460, 79.672),
+}
+MATERIAL_ROUTE_OFFSETS = {
+    "REROUTE": (448.008, -32.197),
+    "VIEWER": (575.460, 1.196),
+    "GROUP_OUTPUT": (575.460, -74.200),
+}
+ROUTE_OWNER_MARKER = "cryptomatte_id_color_route_owner"
+ROUTE_ROLE_MARKER = "cryptomatte_id_color_route_role"
 ADDON_PACKAGE = __package__ or __name__
 EXR_OUTPUT_MARKER = "cryptomatte_id_color_exr_output"
 PSD_OUTPUT_MARKER = "cryptomatte_id_color_psd_output"
 PSD_LAYER_NAME_MARKER = "cryptomatte_id_color_psd_layer_name"
 PSD_LAYER_FILE_MARKER = "cryptomatte_id_color_psd_layer_file"
 DEFAULT_EXR_OUTPUT_DIR = "/tmp\\"
+REMEMBERED_SCENE_SETTINGS = (
+    ("cryptomatte_use_exr", "remembered_use_exr", False),
+    ("cryptomatte_use_psd", "remembered_use_psd", False),
+    ("cryptomatte_camera_visible_only", "remembered_camera_visible_only", True),
+    ("cryptomatte_low_memory", "remembered_low_memory", False),
+    ("cryptomatte_exr_output_path", "remembered_output_path", DEFAULT_EXR_OUTPUT_DIR),
+)
 
 SHORTCUT_TARGETS = (
     ("object_id.create", "Object ID", "O", {"alt": True}),
     ("object_id.create_material", "Material ID", "M", {"alt": True}),
     ("object_id.change", "Change ID", "PERIOD", {"alt": True}),
     ("object_id.random", "Random ID", "COMMA", {"alt": True}),
+    ("object_id.render_id_channel", "Render ID Channel", "F12", {"shift": True, "alt": True}),
 )
 
 SHORTCUT_KEYMAP_NAME = "Node Editor"
@@ -76,6 +103,36 @@ addon_keymaps = []
 visibility_prepass_active = False
 visibility_cache = {"key": None, "time": 0.0, "names": ()}
 _icc_profile_bytes_cache = None
+low_memory_render_jobs = {}
+render_id_restore_snapshots = {}
+remembered_settings_loading = False
+export_progress = {
+    "active": False,
+    "scene_name": "",
+    "started_at": 0.0,
+    "completed": 0.0,
+    "total": 1.0,
+    "phase": "",
+    "history_key": None,
+    "estimated_total": None,
+    "work_size": 0.0,
+    "workspace_names": (),
+    "ui_installed": False,
+}
+export_duration_history = {}
+export_progress_event_timers = {}
+PROGRESS_RATE_PROPERTIES = {
+    "PSD Export": "cryptomatte_psd_seconds_per_mp_layer",
+    "Low Memory Export": "cryptomatte_low_memory_seconds_per_mp_layer",
+}
+
+
+def _iface(message):
+    return bpy.app.translations.pgettext_iface(message)
+
+
+def _tip(message):
+    return bpy.app.translations.pgettext_tip(message)
 
 
 BLENDER_TO_PS_BLEND = {
@@ -86,6 +143,209 @@ BLENDER_TO_PS_BLEND = {
     "DIVIDE": b"fdiv", "HUE": b"hue ", "SATURATION": b"sat ",
     "COLOR": b"colr", "VALUE": b"lum ", "PASS_THROUGH": b"pass",
 }
+
+
+def _tag_statusbar_redraw():
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None:
+        return
+    for window in window_manager.windows:
+        screen = window.screen
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type == "STATUSBAR":
+                area.tag_redraw()
+
+
+def _sync_export_progress_event_timers(enabled):
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None:
+        if not enabled:
+            export_progress_event_timers.clear()
+        return
+
+    live_windows = set()
+    if enabled and not bpy.app.background:
+        for window in tuple(window_manager.windows):
+            window_key = window.as_pointer()
+            live_windows.add(window_key)
+            if window_key in export_progress_event_timers:
+                continue
+            try:
+                export_progress_event_timers[window_key] = window_manager.event_timer_add(
+                    0.25,
+                    window=window,
+                )
+            except (RuntimeError, TypeError):
+                continue
+
+    for window_key, timer in tuple(export_progress_event_timers.items()):
+        if enabled and window_key in live_windows:
+            continue
+        try:
+            window_manager.event_timer_remove(timer)
+        except (ReferenceError, RuntimeError):
+            pass
+        export_progress_event_timers.pop(window_key, None)
+
+
+def _export_progress_key(scene, phase):
+    return (
+        phase,
+        scene.name,
+        scene.render.resolution_x,
+        scene.render.resolution_y,
+        scene.render.resolution_percentage,
+        bool(getattr(scene, "cryptomatte_use_exr", False)),
+        bool(getattr(scene, "cryptomatte_use_psd", False)),
+    )
+
+
+def _progress_work_size(scene, layer_count):
+    width = max(1, round(scene.render.resolution_x * scene.render.resolution_percentage / 100.0))
+    height = max(1, round(scene.render.resolution_y * scene.render.resolution_percentage / 100.0))
+    return width * height * max(1, layer_count) / 1_000_000.0
+
+
+def _progress_redraw_timer():
+    if export_progress["active"]:
+        if not export_progress["ui_installed"]:
+            _set_export_status_draw(True)
+            export_progress["ui_installed"] = True
+        _sync_export_progress_event_timers(True)
+        _tag_statusbar_redraw()
+        return 0.25
+    _sync_export_progress_event_timers(False)
+    if export_progress["ui_installed"]:
+        _set_export_status_draw(False)
+        export_progress["ui_installed"] = False
+        export_progress["workspace_names"] = ()
+        _tag_statusbar_redraw()
+    return None
+
+
+def _set_export_status_draw(enabled):
+    workspace_names = set()
+    if enabled:
+        window_manager = getattr(bpy.context, "window_manager", None)
+        if window_manager is not None:
+            workspace_names.update(
+                window.workspace.name
+                for window in window_manager.windows
+                if window.workspace is not None
+            )
+        context_workspace = getattr(bpy.context, "workspace", None)
+        if context_workspace is not None:
+            workspace_names.add(context_workspace.name)
+        export_progress["workspace_names"] = tuple(workspace_names)
+    else:
+        workspace_names.update(export_progress["workspace_names"])
+
+    workspaces = getattr(bpy.data, "workspaces", None)
+    if workspaces is None:
+        return
+    for workspace_name in workspace_names:
+        workspace = workspaces.get(workspace_name)
+        if workspace is not None:
+            workspace.status_text_set(_draw_export_status if enabled else None)
+
+
+def _begin_export_progress(scene, total=1, phase="Export", work_size=0.0):
+    if export_progress["active"]:
+        _end_export_progress()
+
+    history_key = _export_progress_key(scene, phase)
+    estimated_total = export_duration_history.get(history_key)
+    rate_property = PROGRESS_RATE_PROPERTIES.get(phase)
+    if estimated_total is None and rate_property and work_size > 0.0:
+        learned_rate = max(0.0, float(getattr(scene, rate_property, 0.0)))
+        if learned_rate > 0.0:
+            estimated_total = learned_rate * work_size
+    export_progress["started_at"] = time.perf_counter()
+    export_progress.update({
+        "active": True,
+        "scene_name": scene.name,
+        "completed": 0.0,
+        "total": max(1.0, float(total)),
+        "phase": phase,
+        "history_key": history_key,
+        "estimated_total": estimated_total,
+        "work_size": max(0.0, float(work_size)),
+    })
+    if not bpy.app.timers.is_registered(_progress_redraw_timer):
+        bpy.app.timers.register(_progress_redraw_timer, first_interval=0.1)
+
+
+def _update_export_progress(completed, total=None):
+    if not export_progress["active"]:
+        return
+    if total is not None:
+        export_progress["total"] = max(1.0, float(total))
+    export_progress["completed"] = max(0.0, float(completed))
+    factor = min(1.0, export_progress["completed"] / export_progress["total"])
+    if factor > 0.0:
+        elapsed = max(0.001, time.perf_counter() - export_progress["started_at"])
+        measured_total = elapsed / factor
+        previous = export_progress["estimated_total"]
+        export_progress["estimated_total"] = (
+            measured_total
+            if previous is None
+            else previous * 0.65 + measured_total * 0.35
+        )
+
+
+def _end_export_progress():
+    if not export_progress["active"]:
+        return
+    elapsed = max(0.0, time.perf_counter() - export_progress["started_at"])
+    history_key = export_progress["history_key"]
+    if history_key is not None and elapsed > 0.0:
+        previous = export_duration_history.get(history_key)
+        export_duration_history[history_key] = elapsed if previous is None else previous * 0.4 + elapsed * 0.6
+    scene = getattr(getattr(bpy, "data", None), "scenes", {}).get(export_progress["scene_name"])
+    rate_property = PROGRESS_RATE_PROPERTIES.get(export_progress["phase"])
+    work_size = export_progress["work_size"]
+    if scene is not None and rate_property and work_size > 0.0 and elapsed > 0.0:
+        measured_rate = elapsed / work_size
+        previous_rate = max(0.0, float(getattr(scene, rate_property, 0.0)))
+        setattr(scene, rate_property, measured_rate if previous_rate <= 0.0 else previous_rate * 0.4 + measured_rate * 0.6)
+    export_progress.update({
+        "active": False,
+        "scene_name": "",
+        "started_at": 0.0,
+        "completed": 0.0,
+        "total": 1.0,
+        "phase": "",
+        "history_key": None,
+        "estimated_total": None,
+        "work_size": 0.0,
+    })
+
+
+def _draw_export_status(self, _context):
+    if not export_progress["active"]:
+        return
+    elapsed = max(0.0, time.perf_counter() - export_progress["started_at"])
+    completed = export_progress["completed"]
+    total = export_progress["total"]
+    factor = min(1.0, completed / total)
+    estimated = export_progress["estimated_total"]
+    elapsed_seconds = int(elapsed + 0.5)
+    total_text = "--" if estimated is None else str(max(elapsed_seconds, int(estimated + 0.5)))
+    percent = min(100, max(0, round(factor * 100.0)))
+
+    layout = self.layout
+    layout.template_input_status()
+    layout.separator_spacer()
+    row = layout.row(align=True)
+    row.label(text="Exporting...", icon="RENDER_STILL")
+    progress = row.row(align=True)
+    progress.ui_units_x = 6
+    progress.progress(factor=factor, type="BAR", text=f"{percent}%")
+    row.label(text=f"{elapsed_seconds}s/{total_text}s", icon="TIME")
+    layout.separator_spacer()
+    layout.template_status_info()
 
 # sRGB v4 profile, stored compressed to keep the embedded PSD library compact.
 ICC_PROFILE_B64_SRGB_V4 = (
@@ -240,6 +500,8 @@ def _camera_visible_renderable_objects(context):
 
     global visibility_prepass_active
     original_engine = scene.render.engine
+    original_use_compositing = scene.render.use_compositing
+    original_use_render_cache = scene.render.use_render_cache
     original_tree = _scene_compositor_tree(scene)
     original_resolution = (scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage)
     original_render_aa = getattr(scene.display, "render_aa", None)
@@ -301,6 +563,8 @@ def _camera_visible_renderable_objects(context):
         scene.render.resolution_x = mask_width
         scene.render.resolution_y = mask_height
         scene.render.resolution_percentage = 100
+        scene.render.use_compositing = True
+        scene.render.use_render_cache = False
         temporary_tree = bpy.data.node_groups.new("CryptoMatte Visibility Memory", "CompositorNodeTree")
         scene.compositing_node_group = temporary_tree
         render_layers = temporary_tree.nodes.new("CompositorNodeRLayers")
@@ -355,6 +619,8 @@ def _camera_visible_renderable_objects(context):
         scene.display.shading.light, scene.display.shading.color_type, scene.display.shading.background_type, background_color = original_shading
         scene.display.shading.background_color = background_color
         scene.compositing_node_group = original_tree
+        scene.render.use_compositing = original_use_compositing
+        scene.render.use_render_cache = original_use_render_cache
         if temporary_tree:
             bpy.data.node_groups.remove(temporary_tree)
         visibility_prepass_active = False
@@ -394,6 +660,20 @@ def _ensure_group_socket(group, name, in_out, socket_type="NodeSocketColor"):
         return group.inputs.new(socket_type, name)
 
     return group.outputs.new(socket_type, name)
+
+
+def _ensure_output_socket(tree, name, socket_type="NodeSocketColor"):
+    if hasattr(tree, "interface"):
+        for item in tree.interface.items_tree:
+            if item.item_type == "SOCKET" and item.in_out == "OUTPUT" and item.name == name:
+                return item
+        return tree.interface.new_socket(name=name, in_out="OUTPUT", socket_type=socket_type)
+
+    socket = tree.outputs.get(name)
+    if socket:
+        return socket
+
+    return tree.outputs.new(socket_type, name)
 
 
 def _set_interface_default(group, socket_name, value):
@@ -436,13 +716,73 @@ def _remove_old_group(scene, group_name):
     tree = _scene_compositor_tree(scene)
 
     if tree:
-        for node in list(tree.nodes):
-            if node.bl_idname == "CompositorNodeGroup" and node.node_tree and node.node_tree.name == group_name:
-                tree.nodes.remove(node)
+        old_group_nodes = [
+            node
+            for node in tree.nodes
+            if node.bl_idname == "CompositorNodeGroup"
+            and node.node_tree
+            and node.node_tree.name == group_name
+        ]
+        route_nodes = {
+            node
+            for node in tree.nodes
+            if node.get(ROUTE_OWNER_MARKER) == group_name
+        }
+        frontier = list(old_group_nodes)
+        while frontier:
+            source = frontier.pop()
+            for link in list(tree.links):
+                target = link.to_node
+                if link.from_node != source or target.bl_idname not in {
+                    "NodeReroute",
+                    "CompositorNodeViewer",
+                    "NodeGroupOutput",
+                }:
+                    continue
+                if target not in route_nodes:
+                    route_nodes.add(target)
+                    frontier.append(target)
+
+        for node in route_nodes:
+            tree.nodes.remove(node)
+        for node in old_group_nodes:
+            tree.nodes.remove(node)
 
     group = bpy.data.node_groups.get(group_name)
     if group:
         bpy.data.node_groups.remove(group, do_unlink=True)
+
+
+def _remove_all_output_routes(tree):
+    """Keep only one generated Viewer/Group Output route in the scene tree."""
+    route_nodes = {
+        node
+        for node in tree.nodes
+        if node.get(ROUTE_OWNER_MARKER) in {OBJECT_GROUP_NAME, MATERIAL_GROUP_NAME}
+    }
+    frontier = [
+        node
+        for node in tree.nodes
+        if node.bl_idname == "CompositorNodeGroup"
+        and node.node_tree
+        and node.node_tree.name in {OBJECT_GROUP_NAME, MATERIAL_GROUP_NAME}
+    ]
+    while frontier:
+        source = frontier.pop()
+        for link in list(tree.links):
+            target = link.to_node
+            if link.from_node != source or target.bl_idname not in {
+                "NodeReroute",
+                "CompositorNodeViewer",
+                "NodeGroupOutput",
+            }:
+                continue
+            if target not in route_nodes:
+                route_nodes.add(target)
+                frontier.append(target)
+
+    for node in route_nodes:
+        tree.nodes.remove(node)
 
 
 def _configure_cryptomatte_node(node, scene, view_layer, matte_name, layer_name):
@@ -475,7 +815,7 @@ def _project_name():
 
 
 def _exr_output_name(group_name):
-    suffix = "Object" if group_name == OBJECT_GROUP_NAME else "Material"
+    suffix = "Object_IDchannel" if group_name == OBJECT_GROUP_NAME else "Material_IDchannel"
     return f"{_project_name()}_{suffix}"
 
 
@@ -490,6 +830,13 @@ def _remove_generated_output_nodes(group):
             node.get(EXR_OUTPUT_MARKER) or node.get(PSD_OUTPUT_MARKER)
         ):
             group.nodes.remove(node)
+
+
+def _remove_all_generated_output_nodes():
+    for group_name in (OBJECT_GROUP_NAME, MATERIAL_GROUP_NAME):
+        group = bpy.data.node_groups.get(group_name)
+        if group is not None:
+            _remove_generated_output_nodes(group)
 
 
 def _configure_exr_format(node):
@@ -509,7 +856,11 @@ def _file_output_item_socket(node, item_name):
 
 def _sync_exr_output_for_group(context, group, group_name, layers):
     scene = context.scene
-    if not getattr(scene, "cryptomatte_use_exr", False) or not layers:
+    if (
+        getattr(scene, "cryptomatte_low_memory", False)
+        or not getattr(scene, "cryptomatte_use_exr", False)
+        or not layers
+    ):
         return None
 
     output_node = group.nodes.new("CompositorNodeOutputFile")
@@ -539,7 +890,11 @@ def _safe_filename(value, fallback):
 
 def _sync_psd_output_for_group(context, group, group_name, layers):
     scene = context.scene
-    if not getattr(scene, "cryptomatte_use_psd", False) or not layers:
+    if (
+        getattr(scene, "cryptomatte_low_memory", False)
+        or not getattr(scene, "cryptomatte_use_psd", False)
+        or not layers
+    ):
         return []
 
     output_nodes = []
@@ -595,16 +950,15 @@ def _collect_exr_layers(group):
 
 
 def sync_exr_outputs(context):
-    scene = context.scene if context else None
+    scene = getattr(context, "scene", None) if context else None
     if scene is None:
         return
 
-    for group_name in (OBJECT_GROUP_NAME, MATERIAL_GROUP_NAME):
-        group = bpy.data.node_groups.get(group_name)
-        if group is not None:
-            _remove_generated_output_nodes(group)
+    _remove_all_generated_output_nodes()
 
     if not (getattr(scene, "cryptomatte_use_exr", False) or getattr(scene, "cryptomatte_use_psd", False)):
+        return
+    if getattr(scene, "cryptomatte_low_memory", False):
         return
 
     group_node = _active_viewer_group_node(scene)
@@ -617,7 +971,80 @@ def sync_exr_outputs(context):
     _sync_psd_output_for_group(context, group, group.name, layers)
 
 
+def _remember_scene_settings(scene, context):
+    if remembered_settings_loading:
+        return
+    preferences = _addon_preferences(context)
+    if preferences is None:
+        return
+    for scene_property, preference_property, default in REMEMBERED_SCENE_SETTINGS:
+        setattr(
+            preferences,
+            preference_property,
+            getattr(scene, scene_property, default),
+        )
+    preferences.remembered_settings_initialized = True
+
+
+def _apply_remembered_scene_settings(scenes, context):
+    global remembered_settings_loading
+    preferences = _addon_preferences(context)
+    if preferences is None or scenes is None:
+        return
+
+    if not preferences.remembered_settings_initialized:
+        for _scene_property, preference_property, default in REMEMBERED_SCENE_SETTINGS:
+            setattr(preferences, preference_property, default)
+        preferences.remembered_settings_initialized = True
+
+    remembered_settings_loading = True
+    try:
+        for scene in scenes:
+            for scene_property, preference_property, _default in REMEMBERED_SCENE_SETTINGS:
+                setattr(scene, scene_property, getattr(preferences, preference_property))
+    finally:
+        remembered_settings_loading = False
+
+
+@persistent
+def restore_remembered_scene_settings_after_load(_dummy):
+    _apply_remembered_scene_settings(getattr(bpy.data, "scenes", None), bpy.context)
+
+
+def _restore_remembered_scene_settings_timer():
+    restore_remembered_scene_settings_after_load(None)
+    return None
+
+
+def update_remembered_scene_settings(self, context):
+    _remember_scene_settings(self, context)
+
+
 def update_exr_output_settings(self, context):
+    _remember_scene_settings(self, context)
+    sync_exr_outputs(context)
+
+
+def _enable_low_memory_scene(scene):
+    if not getattr(scene, "cryptomatte_low_memory_override_active", False):
+        scene.cryptomatte_low_memory_previous_render_cache = scene.render.use_render_cache
+        scene.cryptomatte_low_memory_override_active = True
+    scene.render.use_render_cache = True
+    _remove_all_generated_output_nodes()
+
+
+def _disable_low_memory_scene(scene):
+    if getattr(scene, "cryptomatte_low_memory_override_active", False):
+        scene.render.use_render_cache = scene.cryptomatte_low_memory_previous_render_cache
+        scene.cryptomatte_low_memory_override_active = False
+
+
+def update_low_memory_settings(self, context):
+    _remember_scene_settings(self, context)
+    if getattr(self, "cryptomatte_low_memory", False):
+        _enable_low_memory_scene(self)
+    else:
+        _disable_low_memory_scene(self)
     sync_exr_outputs(context)
 
 
@@ -687,14 +1114,14 @@ def _psd_color_context(scene):
     config = ocio.GetCurrentConfig()
     transform = ocio.DisplayViewTransform()
     transform.setSrc("scene_linear")
-    transform.setDisplay(scene.display_settings.display_device)
-    transform.setView(scene.view_settings.view_transform)
+    transform.setDisplay("sRGB")
+    transform.setView("Standard")
     return {
         "config": config,
         "display_processor": config.getProcessor(transform).getDefaultCPUProcessor(),
         "source_processors": {},
-        "exposure_scale": 2.0 ** scene.view_settings.exposure,
-        "gamma": scene.view_settings.gamma,
+        "exposure_scale": 1.0,
+        "gamma": 1.0,
     }
 
 
@@ -834,7 +1261,7 @@ def _encode_psd_composite(composite, bit_depth):
     return channels
 
 
-def export_psd_from_blender(psd_data):
+def export_psd_from_blender(psd_data, progress_callback=None):
     """Write a layered PSD/PSB from local image paths or in-memory RGBA layers."""
     use_psb = bool(psd_data.get("use_psb", False))
     compression = psd_data.get("compression", "RLE" if psd_data.get("use_rle", True) else "RAW").upper()
@@ -852,9 +1279,19 @@ def export_psd_from_blender(psd_data):
     layers = []
     width = height = 0
     composite = None
+    progress_total = len(flat_layers) * 6 + 1
+    progress_completed = 0.0
+
+    def notify_progress(units=1.0):
+        nonlocal progress_completed
+        progress_completed += units
+        if progress_callback is not None:
+            progress_callback(progress_completed, progress_total)
+
     for layer in flat_layers:
         if layer["is_marker"]:
             layers.append((layer, [struct.pack(">H", 0)] * 4))
+            notify_progress(6)
             continue
         if layer.get("mask") is not None:
             mask = np.asarray(layer["mask"], dtype=np.float32)
@@ -879,18 +1316,28 @@ def export_psd_from_blender(psd_data):
             path = bpy.path.abspath(layer["path"])
             if not path or not os.path.isfile(path):
                 print(f"CryptoMatte ID Color: PSD layer not found: {path}")
+                notify_progress(6)
                 continue
             layer_width, layer_height, raw_channels = _read_local_image(
                 path, bit_depth, color_context, layer.get("color_space", "")
             )
+        notify_progress()
         if not width:
             width, height = layer_width, layer_height
         if (layer_width, layer_height) != (width, height):
             print(f"CryptoMatte ID Color: PSD layer size mismatch: {layer['name']}")
+            notify_progress(5)
             continue
         composite = _composite_psd_layer(composite, raw_channels, width, height, bit_depth, layer)
+        notify_progress()
         row_bytes = width * (2 if bit_depth == 16 else 1)
-        layers.append((layer, [process_channel_data(channel, row_bytes, height, compression, use_psb) for channel in raw_channels]))
+        compressed_channels = []
+        for channel in raw_channels:
+            compressed_channels.append(
+                process_channel_data(channel, row_bytes, height, compression, use_psb)
+            )
+            notify_progress()
+        layers.append((layer, compressed_channels))
     if not layers or not width or composite is None:
         return False
 
@@ -942,7 +1389,533 @@ def export_psd_from_blender(psd_data):
         file_handle.write(struct.pack(">H", 0))
         for channel in composite_channels:
             file_handle.write(channel)
+    notify_progress()
     return True
+
+
+# --- Serial low-memory export ---
+
+def _render_cache_directory():
+    configured = bpy.context.preferences.filepaths.render_cache_directory
+    return bpy.path.abspath(configured) if configured else tempfile.gettempdir()
+
+
+def _render_cache_snapshot():
+    snapshot = {}
+    for path in glob.glob(os.path.join(_render_cache_directory(), "cached_RR*.exr")):
+        try:
+            stat = os.stat(path)
+            snapshot[path] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            pass
+    return snapshot
+
+
+def _cryptomatte_cache_info(path, group_name):
+    image_input = oiio.ImageInput.open(path)
+    if image_input is None:
+        raise RuntimeError(f"Could not open Blender render cache: {path}")
+    try:
+        if not image_input.seek_subimage(0, 0):
+            raise RuntimeError("The Blender render cache has no image data.")
+        metadata = {attribute.name: attribute.value for attribute in image_input.spec().extra_attribs}
+        pass_suffix = ".CryptoObject" if group_name == OBJECT_GROUP_NAME else ".CryptoMaterial"
+        metadata_root = None
+        pass_prefix = None
+        for name, value in metadata.items():
+            if name.endswith("/name") and str(value).endswith(pass_suffix):
+                metadata_root = name.rsplit("/", 1)[0]
+                pass_prefix = str(value)
+                break
+        if metadata_root is None:
+            raise RuntimeError(f"{pass_suffix[1:]} was not found in Blender's render cache.")
+
+        manifest_value = metadata.get(f"{metadata_root}/manifest", "{}")
+        manifest = json.loads(str(manifest_value))
+        parts = []
+        width = height = 0
+        subimage = 0
+        while image_input.seek_subimage(subimage, 0):
+            spec = image_input.spec()
+            channel_map = {name.lower(): index for index, name in enumerate(spec.channelnames)}
+            stems = {
+                name.rsplit(".", 1)[0]
+                for name in spec.channelnames
+                if name.lower().startswith(pass_prefix.lower())
+            }
+            for stem in stems:
+                suffix = stem[len(pass_prefix):]
+                if not suffix.isdigit():
+                    continue
+                indices = [
+                    channel_map.get(f"{stem}.{channel}".lower())
+                    for channel in ("r", "g", "b", "a")
+                ]
+                if all(index is not None for index in indices):
+                    parts.append((subimage, tuple(indices)))
+                    width, height = spec.width, spec.height
+            subimage += 1
+        if not parts or width <= 0 or height <= 0:
+            raise RuntimeError(f"No {pass_suffix[1:]} pixel channels were found in Blender's render cache.")
+        return {
+            "manifest": manifest,
+            "parts": tuple(parts),
+            "width": width,
+            "height": height,
+        }
+    finally:
+        image_input.close()
+
+
+def _read_cryptomatte_mask(path, cache_info, target_id, progress_callback=None):
+    height = cache_info["height"]
+    width = cache_info["width"]
+    if target_id is None:
+        if progress_callback is not None:
+            for _part in cache_info["parts"]:
+                progress_callback()
+        return np.zeros((height, width), dtype=np.bool_)
+
+    image_input = oiio.ImageInput.open(path)
+    if image_input is None:
+        raise RuntimeError(f"Could not reopen Blender render cache: {path}")
+    mask = np.zeros((height, width), dtype=np.bool_)
+    try:
+        for subimage, indices in cache_info["parts"]:
+            if not image_input.seek_subimage(subimage, 0):
+                raise RuntimeError(f"Could not read Cryptomatte cache part {subimage}.")
+            spec = image_input.spec()
+            pixels = np.asarray(
+                image_input.read_image(oiio.FLOAT),
+                dtype=np.float32,
+            ).reshape((spec.height, spec.width, spec.nchannels))
+            red, green, blue, alpha = indices
+            mask |= pixels[:, :, red].view(np.uint32) == target_id
+            mask |= pixels[:, :, blue].view(np.uint32) == target_id
+            del pixels
+            if progress_callback is not None:
+                progress_callback()
+        return mask
+    finally:
+        image_input.close()
+
+
+class _LowMemoryEXRWriter:
+    def __init__(self, output_path, width, height, layer_names):
+        self.output_path = output_path
+        self.temporary_path = output_path + ".lowmem.exr"
+        self.specs = []
+        for layer_name in layer_names:
+            spec = oiio.ImageSpec(width, height, 4, oiio.HALF)
+            spec.channelnames = [f"{layer_name}.{channel}" for channel in "RGBA"]
+            spec.attribute("compression", "dwaa")
+            spec.attribute("openexr:dwaCompressionLevel", 90.0)
+            spec.attribute("oiio:ColorSpace", "scene_linear")
+            spec.attribute("oiio:subimagename", layer_name)
+            self.specs.append(spec)
+        self.output = oiio.ImageOutput.create(self.temporary_path)
+        if self.output is None or not self.output.open(self.temporary_path, tuple(self.specs)):
+            raise RuntimeError(f"Could not create low-memory EXR: {self.temporary_path}")
+        self.index = 0
+
+    def write_layer(self, color, mask):
+        if self.index > 0 and not self.output.open(
+            self.temporary_path,
+            self.specs[self.index],
+            "AppendSubimage",
+        ):
+            raise RuntimeError(self.output.geterror())
+        height, width = mask.shape
+        pixels = np.empty((height, width, 4), dtype=np.float16)
+        pixels[:, :, :3] = color
+        pixels[:, :, 3] = mask
+        if not self.output.write_image(pixels):
+            raise RuntimeError(self.output.geterror())
+        self.index += 1
+        del pixels
+
+    def finish(self):
+        if self.output is not None:
+            if not self.output.close():
+                raise RuntimeError(self.output.geterror())
+            self.output = None
+        os.replace(self.temporary_path, self.output_path)
+
+    def abort(self):
+        if self.output is not None:
+            self.output.close()
+            self.output = None
+        if os.path.isfile(self.temporary_path):
+            os.remove(self.temporary_path)
+
+
+class _LowMemoryPSDWriter:
+    def __init__(self, scene, output_path, width, height):
+        self.scene = scene
+        self.output_path = output_path
+        self.temporary_path = output_path + ".lowmem.psd"
+        output_directory = os.path.dirname(output_path) or "."
+        os.makedirs(output_directory, exist_ok=True)
+        self.spool_directory = tempfile.mkdtemp(
+            prefix=".cryptomatte_id_color_",
+            dir=output_directory,
+        )
+        self.width = width
+        self.height = height
+        self.pixel_count = width * height
+        self.color_context = _psd_color_context(scene)
+        self.entries = []
+        self.composite_rgb = np.zeros((height, width, 3), dtype=np.float32)
+        self.composite_alpha = np.zeros((height, width), dtype=np.float32)
+
+    def write_layer(self, layer_name, color, mask, progress_callback=None):
+        sample = np.empty((1, 1, 4), dtype=np.float32)
+        sample[0, 0, :3] = color
+        sample[0, 0, 3] = 1.0
+        encoded_sample = _encode_psd_rgba(sample, 8, self.color_context)
+        rgb_values = [channel[0] for channel in encoded_sample[:3]]
+        alpha_bytes = (np.asarray(mask, dtype=np.uint8) * 255).tobytes()
+        if progress_callback is not None:
+            progress_callback()
+        spool_path = os.path.join(self.spool_directory, f"{len(self.entries):06d}.bin")
+        channel_lengths = []
+        with open(spool_path, "wb") as spool:
+            for value in rgb_values:
+                channel_data = process_channel_data(
+                    bytes((value,)) * self.pixel_count,
+                    self.width,
+                    self.height,
+                    "ZIP",
+                    False,
+                )
+                channel_lengths.append(len(channel_data))
+                spool.write(channel_data)
+                del channel_data
+                if progress_callback is not None:
+                    progress_callback()
+            alpha_data = process_channel_data(
+                alpha_bytes,
+                self.width,
+                self.height,
+                "ZIP",
+                False,
+            )
+            channel_lengths.append(len(alpha_data))
+            spool.write(alpha_data)
+            del alpha_data
+            if progress_callback is not None:
+                progress_callback()
+
+        display_color = np.asarray(rgb_values, dtype=np.float32) / 255.0
+        self.composite_rgb[mask] = display_color
+        self.composite_alpha[mask] = 1.0
+        self.entries.append({
+            "name": layer_name,
+            "channel_lengths": tuple(channel_lengths),
+            "spool_path": spool_path,
+        })
+        del sample, encoded_sample, alpha_bytes
+
+    def finish(self):
+        entries = list(reversed(self.entries))
+        records = []
+        channel_data_length = 0
+        for entry in entries:
+            layer = {
+                "name": entry["name"],
+                "folder_type": 0,
+                "hide": False,
+                "opacity": 1.0,
+                "blend": "MIX",
+            }
+            record = bytearray()
+            record.extend(struct.pack(">IIII", 0, 0, self.height, self.width))
+            record.extend(struct.pack(">H", 4))
+            for channel_id, length in zip((0, 1, 2, -1), entry["channel_lengths"]):
+                record.extend(struct.pack(">hI", channel_id, length))
+                channel_data_length += length
+            record.extend(b"8BIM" + BLENDER_TO_PS_BLEND["MIX"])
+            record.extend(bytes((255, 0, 8, 0)))
+            extra = _layer_extra_data(layer)
+            record.extend(struct.pack(">I", len(extra)))
+            record.extend(extra)
+            records.append(record)
+
+        layer_info_length = 2 + sum(len(record) for record in records) + channel_data_length
+        padded_layer_info_length = layer_info_length + layer_info_length % 2
+        layer_mask_length = 4 + padded_layer_info_length + 4
+        composite_channels = _encode_psd_composite(
+            (self.composite_rgb, self.composite_alpha),
+            8,
+        )
+        resolution = int(300.0 * 65536)
+        resources = (
+            b"8BIM"
+            + struct.pack(">H", 1005)
+            + b"\0\0"
+            + struct.pack(">I", 16)
+            + struct.pack(">IHHIHH", resolution, 1, 1, resolution, 1, 1)
+        )
+        try:
+            icc = _icc_profile_bytes()
+            resources += (
+                b"8BIM"
+                + struct.pack(">H", 1039)
+                + b"\0\0"
+                + struct.pack(">I", len(icc))
+                + icc
+                + (b"\0" if len(icc) % 2 else b"")
+            )
+        except Exception as error:
+            print(f"CryptoMatte ID Color: ICC profile skipped: {error}")
+
+        try:
+            with open(self.temporary_path, "wb") as file_handle:
+                file_handle.write(
+                    struct.pack(
+                        ">4sH6sHIIHH",
+                        b"8BPS",
+                        1,
+                        b"\0" * 6,
+                        4,
+                        self.height,
+                        self.width,
+                        8,
+                        3,
+                    )
+                )
+                file_handle.write(struct.pack(">I", 0))
+                file_handle.write(struct.pack(">I", len(resources)) + resources)
+                file_handle.write(struct.pack(">I", layer_mask_length))
+                file_handle.write(struct.pack(">I", layer_info_length))
+                file_handle.write(struct.pack(">h", -len(entries)))
+                for record in records:
+                    file_handle.write(record)
+                for entry in entries:
+                    with open(entry["spool_path"], "rb") as spool:
+                        shutil.copyfileobj(spool, file_handle, length=1024 * 1024)
+                if layer_info_length % 2:
+                    file_handle.write(b"\0")
+                file_handle.write(struct.pack(">I", 0))
+                file_handle.write(struct.pack(">H", 0))
+                for channel in composite_channels:
+                    file_handle.write(channel)
+            os.replace(self.temporary_path, self.output_path)
+        finally:
+            shutil.rmtree(self.spool_directory, ignore_errors=True)
+
+    def abort(self):
+        shutil.rmtree(self.spool_directory, ignore_errors=True)
+        if os.path.isfile(self.temporary_path):
+            os.remove(self.temporary_path)
+
+
+def _fail_low_memory_job(scene_name, error):
+    state = low_memory_render_jobs.pop(scene_name, None)
+    if state is None:
+        return
+    for writer_name in ("exr_writer", "psd_writer"):
+        writer = state.get(writer_name)
+        if writer is not None:
+            writer.abort()
+    _end_export_progress()
+    print(f"CryptoMatte ID Color: Low-memory export failed: {error}")
+    traceback.print_exc()
+
+
+def _advance_low_memory_job(scene_name):
+    state = low_memory_render_jobs.get(scene_name)
+    scene = bpy.data.scenes.get(scene_name)
+    if state is None or scene is None:
+        return None
+
+    def advance_work(units=1.0):
+        state["work_completed"] += units
+        _update_export_progress(state["work_completed"], state["work_total"])
+
+    try:
+        if state["phase"] == "WAIT_CACHE":
+            candidates = []
+            for path in glob.glob(os.path.join(_render_cache_directory(), "cached_RR*.exr")):
+                try:
+                    stat = os.stat(path)
+                except OSError:
+                    continue
+                signature = (stat.st_mtime_ns, stat.st_size)
+                if state["cache_snapshot"].get(path) != signature:
+                    candidates.append((stat.st_mtime_ns, path, signature))
+            if not candidates:
+                if time.perf_counter() - state["started_at"] > 300.0:
+                    raise RuntimeError("Blender's disk render cache was not created.")
+                return 0.25
+
+            _mtime, cache_path, signature = max(candidates)
+            if state.get("cache_candidate") != (cache_path, signature):
+                state["cache_candidate"] = (cache_path, signature)
+                state["cache_stable_at"] = time.perf_counter()
+                return 0.25
+            if time.perf_counter() - state["cache_stable_at"] < 1.0:
+                return 0.25
+
+            cache_info = _cryptomatte_cache_info(cache_path, state["group_name"])
+            state["cache_path"] = cache_path
+            state["cache_info"] = cache_info
+            output_directory = _exr_output_directory(scene)
+            os.makedirs(output_directory, exist_ok=True)
+            output_base = os.path.join(
+                output_directory,
+                _exr_output_name(state["group_name"]),
+            )
+            layer_names = [layer["name"] for layer in state["layers"]]
+            if state["use_exr"]:
+                state["exr_writer"] = _LowMemoryEXRWriter(
+                    output_base + ".exr",
+                    cache_info["width"],
+                    cache_info["height"],
+                    layer_names,
+                )
+            if state["use_psd"]:
+                state["psd_writer"] = _LowMemoryPSDWriter(
+                    scene,
+                    output_base + ".psd",
+                    cache_info["width"],
+                    cache_info["height"],
+                )
+            units_per_layer = (
+                len(cache_info["parts"])
+                + (1 if state["use_exr"] else 0)
+                + (5 if state["use_psd"] else 0)
+            )
+            state["work_total"] = 2 + len(state["layers"]) * units_per_layer
+            state["phase"] = "LAYERS"
+            advance_work()
+            return 0.01
+
+        index = state["layer_index"]
+        if index < len(state["layers"]):
+            layer = state["layers"][index]
+            manifest_hex = state["cache_info"]["manifest"].get(layer["name"])
+            target_id = int(manifest_hex, 16) if manifest_hex else None
+            mask = _read_cryptomatte_mask(
+                state["cache_path"],
+                state["cache_info"],
+                target_id,
+                progress_callback=advance_work,
+            )
+            if state.get("exr_writer") is not None:
+                state["exr_writer"].write_layer(layer["color"], mask)
+                advance_work()
+            if state.get("psd_writer") is not None:
+                state["psd_writer"].write_layer(
+                    layer["name"],
+                    layer["color"],
+                    mask,
+                    progress_callback=advance_work,
+                )
+            state["layer_index"] += 1
+            print(
+                f"CryptoMatte ID Color: Low-memory layer "
+                f"{state['layer_index']}/{len(state['layers'])}: {layer['name']}"
+            )
+            del mask
+            gc.collect()
+            return 0.01
+
+        if state.get("exr_writer") is not None:
+            state["exr_writer"].finish()
+        if state.get("psd_writer") is not None:
+            state["psd_writer"].finish()
+        advance_work()
+        _end_export_progress()
+        low_memory_render_jobs.pop(scene_name, None)
+        print("CryptoMatte ID Color: Low-memory serial export completed.")
+        gc.collect()
+        return None
+    except Exception as error:
+        _fail_low_memory_job(scene_name, error)
+        return None
+
+
+@persistent
+def prepare_low_memory_render(scene):
+    if (
+        visibility_prepass_active
+        or not getattr(scene, "cryptomatte_low_memory", False)
+        or not (
+            getattr(scene, "cryptomatte_use_exr", False)
+            or getattr(scene, "cryptomatte_use_psd", False)
+        )
+    ):
+        return
+    group_node = _active_viewer_group_node(scene)
+    group = group_node.node_tree if group_node else None
+    if group is None or group.name not in {OBJECT_GROUP_NAME, MATERIAL_GROUP_NAME}:
+        return
+
+    layers = []
+    for layer_name, _source_socket in _collect_exr_layers(group):
+        color_socket = group_node.inputs.get(layer_name)
+        color = tuple(color_socket.default_value[:3]) if color_socket else (1.0, 1.0, 1.0)
+        layers.append({"name": layer_name, "color": color})
+    if not layers:
+        return
+
+    scene.render.use_render_cache = True
+    low_memory_render_jobs[scene.name] = {
+        "phase": "RENDERING",
+        "started_at": time.perf_counter(),
+        "cache_snapshot": _render_cache_snapshot(),
+        "group_name": group.name,
+        "layers": layers,
+        "layer_index": 0,
+        "work_completed": 0.0,
+        "work_total": (
+            2
+            + len(layers)
+            * (
+                1
+                + (1 if scene.cryptomatte_use_exr else 0)
+                + (5 if scene.cryptomatte_use_psd else 0)
+            )
+        ),
+        "use_exr": bool(scene.cryptomatte_use_exr),
+        "use_psd": bool(scene.cryptomatte_use_psd),
+        "exr_writer": None,
+        "psd_writer": None,
+    }
+    print(
+        f"CryptoMatte ID Color: Low-memory mode will process "
+        f"{len(layers)} layers serially from Blender's render cache."
+    )
+
+
+@persistent
+def start_low_memory_export(scene):
+    if visibility_prepass_active:
+        return
+    state = low_memory_render_jobs.get(scene.name)
+    if state is None or state["phase"] != "RENDERING":
+        return
+    state["phase"] = "WAIT_CACHE"
+    _begin_export_progress(
+        scene,
+        total=state["work_total"],
+        phase="Low Memory Export",
+        work_size=_progress_work_size(scene, len(state["layers"])),
+    )
+    existing_timer = state.get("timer")
+    if existing_timer is None or not bpy.app.timers.is_registered(existing_timer):
+        timer = lambda scene_name=scene.name: _advance_low_memory_job(scene_name)
+        state["timer"] = timer
+        bpy.app.timers.register(timer, first_interval=0.25)
+
+
+@persistent
+def cancel_low_memory_render(scene):
+    if visibility_prepass_active:
+        return
+    low_memory_render_jobs.pop(scene.name, None)
+    _end_export_progress()
 
 
 # --- PSD post-render integration ---
@@ -950,15 +1923,27 @@ def export_psd_from_blender(psd_data):
 
 @persistent
 def export_psd_after_render(scene):
-    if visibility_prepass_active or not getattr(scene, "cryptomatte_use_psd", False):
+    if (
+        visibility_prepass_active
+        or getattr(scene, "cryptomatte_low_memory", False)
+        or not getattr(scene, "cryptomatte_use_psd", False)
+    ):
         return
     group_node = _active_viewer_group_node(scene)
     group = group_node.node_tree if group_node else None
     if group is None:
+        _end_export_progress()
         return
     psd_nodes = sorted((node for node in group.nodes if node.get(PSD_OUTPUT_MARKER)), key=lambda node: node.name)
     if not psd_nodes:
+        _end_export_progress()
         return
+    _begin_export_progress(
+        scene,
+        total=len(psd_nodes) * 6 + 1,
+        phase="PSD Export",
+        work_size=_progress_work_size(scene, len(psd_nodes)),
+    )
     try:
         layer_data = {}
         for index, node in enumerate(psd_nodes):
@@ -974,7 +1959,7 @@ def export_psd_after_render(scene):
                 "compression": "ZIP",
                 "bit_depth": 8,
                 "dpi": 300.0,
-            }):
+            }, progress_callback=_update_export_progress):
                 print(f"CryptoMatte ID Color: PSD saved to {output_path}")
     finally:
         directories = set()
@@ -989,6 +1974,7 @@ def export_psd_after_render(scene):
             parent = os.path.dirname(directory)
             if os.path.isdir(parent) and not os.listdir(parent):
                 os.rmdir(parent)
+        _end_export_progress()
 
 
 # --- ID compositor graph construction ---
@@ -1144,25 +2130,64 @@ def _add_group_node_and_links(context, group, crypto_socket_name, location_y):
     if crypto_socket and id_input:
         tree.links.new(crypto_socket, id_input)
 
-    # The scene compositor is only a display route for this add-on.  Its
-    # Group Output node serves no purpose and makes the generated layout look
-    # like there is a second destination, so remove the legacy node we used
-    # to create and connect only to Viewer.
-    for node in list(tree.nodes):
-        if node.bl_idname == "NodeGroupOutput" and node.label == "Group Output":
-            tree.nodes.remove(node)
+    _remove_all_output_routes(tree)
+    route_offsets = (
+        OBJECT_ROUTE_OFFSETS
+        if group.name == OBJECT_GROUP_NAME
+        else MATERIAL_ROUTE_OFFSETS
+    )
+    _ensure_output_socket(tree, OUTPUT_NAME)
 
-    viewer = _find_or_create_node(tree, "CompositorNodeViewer", "Viewer", (380, location_y))
-    viewer.location = (380, location_y)
+    reroute = tree.nodes.new("NodeReroute")
+    reroute.name = f"{group.name} Reroute"
+    reroute[ROUTE_OWNER_MARKER] = group.name
+    reroute[ROUTE_ROLE_MARKER] = "REROUTE"
+    reroute.location = (
+        group_x + route_offsets["REROUTE"][0],
+        group_y + route_offsets["REROUTE"][1],
+    )
+
+    group_output_node = tree.nodes.new("NodeGroupOutput")
+    group_output_node.name = f"{group.name} Group Output"
+    group_output_node.label = "Group Output"
+    group_output_node[ROUTE_OWNER_MARKER] = group.name
+    group_output_node[ROUTE_ROLE_MARKER] = "GROUP_OUTPUT"
+    group_output_node.location = (
+        group_x + route_offsets["GROUP_OUTPUT"][0],
+        group_y + route_offsets["GROUP_OUTPUT"][1],
+    )
+    try:
+        group_output_node.is_active_output = True
+    except (AttributeError, TypeError):
+        pass
+
+    viewer = tree.nodes.new("CompositorNodeViewer")
+    viewer.name = f"{group.name} Viewer"
+    viewer.label = "Viewer"
+    viewer[ROUTE_OWNER_MARKER] = group.name
+    viewer[ROUTE_ROLE_MARKER] = "VIEWER"
+    viewer.location = (
+        group_x + route_offsets["VIEWER"][0],
+        group_y + route_offsets["VIEWER"][1],
+    )
+    for node in tree.nodes:
+        if node.bl_idname == "CompositorNodeViewer":
+            node.select = False
+    viewer.select = True
+    tree.nodes.active = viewer
 
     group_output = _socket_by_name(group_node.outputs, [OUTPUT_NAME], 0)
+    reroute_input = _socket_by_name(reroute.inputs, ["Input"], 0)
+    reroute_output = _socket_by_name(reroute.outputs, ["Output"], 0)
+    output_input = _socket_by_name(group_output_node.inputs, [OUTPUT_NAME], 0)
     viewer_input = _socket_by_name(viewer.inputs, ["Image"], 0)
 
-    if group_output and viewer_input:
-        for link in list(tree.links):
-            if link.to_socket == viewer_input:
-                tree.links.remove(link)
-        tree.links.new(group_output, viewer_input)
+    if group_output and reroute_input:
+        tree.links.new(group_output, reroute_input)
+    if reroute_output and viewer_input:
+        tree.links.new(reroute_output, viewer_input)
+    if reroute_output and output_input:
+        tree.links.new(reroute_output, output_input)
 
     return crypto_socket is not None
 
@@ -1353,6 +2378,188 @@ def keymap_item_for_operator(context, operator_idname):
     return None, None, None
 
 
+# --- Render ID settings ---
+
+RENDER_SETTINGS_PROPERTIES = {
+    "engine",
+    "preview_pixel_size",
+    "dither_intensity",
+    "filter_size",
+    "film_transparent",
+    "use_freestyle",
+    "threads",
+    "threads_mode",
+    "use_motion_blur",
+    "motion_blur_shutter",
+    "motion_blur_position",
+    "hair_type",
+    "hair_subdiv",
+    "use_high_quality_normals",
+    "anisotropic_filter",
+    "use_compositing",
+    "use_render_cache",
+    "use_simplify",
+    "simplify_subdivision",
+    "simplify_child_particles",
+    "simplify_subdivision_render",
+    "simplify_child_particles_render",
+    "simplify_volumes",
+    "use_simplify_normals",
+    "use_texture_cache",
+    "use_auto_generate_texture_cache",
+    "use_persistent_data",
+    "compositor_device",
+    "compositor_precision",
+    "compositor_denoise_device",
+    "compositor_denoise_preview_quality",
+    "compositor_denoise_final_quality",
+}
+
+
+def _addon_preferences(context):
+    preferences = getattr(context, "preferences", None) if context else None
+    addons = getattr(preferences, "addons", None)
+    addon = addons.get(ADDON_PACKAGE) if addons is not None else None
+    return addon.preferences if addon is not None else None
+
+
+def _snapshot_rna_values(data, allowed_properties=None):
+    values = {}
+    for prop in data.bl_rna.properties:
+        identifier = prop.identifier
+        if (
+            identifier in {"rna_type", "name"}
+            or identifier == "preview_pause"
+            or identifier.startswith("debug_")
+            or prop.is_readonly
+            or prop.type in {"POINTER", "COLLECTION"}
+            or (allowed_properties is not None and identifier not in allowed_properties)
+        ):
+            continue
+        try:
+            value = getattr(data, identifier)
+            if prop.is_array:
+                value = list(value)
+            elif not isinstance(value, (bool, int, float, str)):
+                continue
+            json.dumps(value)
+            values[identifier] = value
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return values
+
+
+def _render_setting_targets(scene, view_layer):
+    targets = {
+        "scene.render": (scene.render, RENDER_SETTINGS_PROPERTIES),
+        "scene.cycles": (getattr(scene, "cycles", None), None),
+        "scene.view_settings": (scene.view_settings, None),
+        "scene.display_settings": (scene.display_settings, None),
+    }
+    view_layer_cycles = getattr(view_layer, "cycles", None) if view_layer else None
+    if view_layer_cycles is not None:
+        targets["view_layer.cycles"] = (view_layer_cycles, None)
+    return targets
+
+
+def _capture_render_settings(scene, view_layer):
+    snapshot = {"schema": 1, "settings": {}}
+    for path, (target, allowed_properties) in _render_setting_targets(scene, view_layer).items():
+        if target is not None:
+            snapshot["settings"][path] = _snapshot_rna_values(target, allowed_properties)
+    return snapshot
+
+
+def _apply_rna_values(target, values, skip=()):
+    applied = 0
+    skipped = 0
+    for identifier, value in values.items():
+        if identifier in skip:
+            continue
+        try:
+            setattr(target, identifier, value)
+            applied += 1
+        except (AttributeError, TypeError, ValueError):
+            skipped += 1
+    return applied, skipped
+
+
+def _apply_render_settings(scene, view_layer, snapshot):
+    settings = snapshot.get("settings", {}) if isinstance(snapshot, dict) else {}
+    targets = _render_setting_targets(scene, view_layer)
+    applied = 0
+    skipped = 0
+
+    render_values = settings.get("scene.render", {})
+    engine = render_values.get("engine")
+    if engine:
+        try:
+            scene.render.engine = engine
+            applied += 1
+        except (AttributeError, TypeError, ValueError):
+            skipped += 1
+
+    for path, values in settings.items():
+        target_entry = targets.get(path)
+        if target_entry is None or not isinstance(values, dict):
+            skipped += len(values) if isinstance(values, dict) else 1
+            continue
+        target = target_entry[0]
+        if target is None:
+            skipped += len(values)
+            continue
+        result = _apply_rna_values(target, values, skip={"engine"} if path == "scene.render" else ())
+        applied += result[0]
+        skipped += result[1]
+    return applied, skipped
+
+
+def _apply_default_render_id_settings(scene):
+    scene.render.engine = "CYCLES"
+    scene.view_settings.gamma = 1.0
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.look = "None"
+    cycles = scene.cycles
+    cycles.samples = 3
+    cycles.use_denoising = False
+    cycles.use_preview_denoising = False
+    cycles.max_bounces = 1
+    cycles.diffuse_bounces = 1
+    cycles.glossy_bounces = 1
+    cycles.transmission_bounces = 0
+    cycles.volume_bounces = 0
+    cycles.transparent_max_bounces = 1
+
+
+def _load_saved_render_settings(preferences):
+    if preferences is None or not preferences.render_id_settings_json:
+        return None
+    try:
+        snapshot = json.loads(preferences.render_id_settings_json)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return snapshot if isinstance(snapshot, dict) and snapshot.get("schema") == 1 else None
+
+
+def _render_setting_record_time(preferences):
+    if preferences is None or preferences.render_id_recorded_at <= 0.0:
+        return "Default setting"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(preferences.render_id_recorded_at))
+
+
+def _restore_render_id_project_settings(scene):
+    state = render_id_restore_snapshots.pop(scene.name, None)
+    if state is None:
+        return
+    view_layer = scene.view_layers.get(state["view_layer_name"])
+    _apply_render_settings(scene, view_layer, state["snapshot"])
+
+
+@persistent
+def restore_render_id_settings_after_render(scene):
+    _restore_render_id_project_settings(scene)
+
+
 # --- Operators ---
 
 class OBJECTID_OT_create(Operator):
@@ -1371,10 +2578,10 @@ class OBJECTID_OT_create(Operator):
         try:
             objects = _camera_visible_renderable_objects(context) if scene.cryptomatte_camera_visible_only else _visible_renderable_objects(context)
         except VisibilityPrepassError as error:
-            self.report({"ERROR"}, str(error))
+            self.report({"ERROR"}, _iface(str(error)))
             return {"CANCELLED"}
         if not objects:
-            self.report({"WARNING"}, "No visible renderable objects found in the current view layer.")
+            self.report({"WARNING"}, _iface("No visible renderable objects found in the current view layer."))
             return {"CANCELLED"}
 
         _ensure_scene_compositor_tree(scene)
@@ -1392,11 +2599,14 @@ class OBJECTID_OT_create(Operator):
         if not has_crypto_socket:
             self.report(
                 {"WARNING"},
-                "ObjectID was created, but CryptoObject00 was not found on the Render Layers node.",
+                _iface("ObjectID was created, but CryptoObject00 was not found on the Render Layers node."),
             )
             return {"FINISHED"}
 
-        self.report({"INFO"}, f"ObjectID created for {len(object_names)} visible objects.")
+        self.report(
+            {"INFO"},
+            _iface("ObjectID created for {count} visible objects.").format(count=len(object_names)),
+        )
         return {"FINISHED"}
 
 
@@ -1416,10 +2626,10 @@ class OBJECTID_OT_create_material(Operator):
         try:
             materials = _visible_materials(context)
         except VisibilityPrepassError as error:
-            self.report({"ERROR"}, str(error))
+            self.report({"ERROR"}, _iface(str(error)))
             return {"CANCELLED"}
         if not materials:
-            self.report({"WARNING"}, "No materials found on visible renderable objects.")
+            self.report({"WARNING"}, _iface("No materials found on visible renderable objects."))
             return {"CANCELLED"}
 
         _ensure_scene_compositor_tree(scene)
@@ -1437,11 +2647,14 @@ class OBJECTID_OT_create_material(Operator):
         if not has_crypto_socket:
             self.report(
                 {"WARNING"},
-                "Material ID was created, but CryptoMaterial00 was not found on the Render Layers node.",
+                _iface("Material ID was created, but CryptoMaterial00 was not found on the Render Layers node."),
             )
             return {"FINISHED"}
 
-        self.report({"INFO"}, f"Material ID created for {len(material_names)} visible materials.")
+        self.report(
+            {"INFO"},
+            _iface("Material ID created for {count} visible materials.").format(count=len(material_names)),
+        )
         return {"FINISHED"}
 
 
@@ -1470,20 +2683,25 @@ class OBJECTID_OT_change(Operator):
     def invoke(self, context, _event):
         selected = context.selected_objects
         if len(selected) != 1:
-            self.report({"ERROR"}, "Please select exactly one object before using Change ID.")
+            self.report({"ERROR"}, _iface("Please select exactly one object before using Change ID."))
             return {"CANCELLED"}
 
         obj = selected[0]
         group_node = _active_viewer_group_node(context.scene)
         if not group_node:
-            self.report({"ERROR"}, "Connect ObjectID or Material ID to the Viewer before using Change ID.")
+            self.report(
+                {"ERROR"},
+                _iface("Connect ObjectID or Material ID to the Viewer before using Change ID."),
+            )
             return {"CANCELLED"}
 
         input_names = _target_input_names_for_viewer_group(obj, group_node)
         if not input_names:
             self.report(
                 {"ERROR"},
-                f"Selected object has no matching input in the active {group_node.node_tree.name} node group.",
+                _iface(
+                    "Selected object has no matching input in the active {group_name} node group."
+                ).format(group_name=group_node.node_tree.name),
             )
             return {"CANCELLED"}
 
@@ -1498,19 +2716,27 @@ class OBJECTID_OT_change(Operator):
     def execute(self, context):
         obj = bpy.data.objects.get(self.object_name)
         if not obj:
-            self.report({"ERROR"}, "Selected object no longer exists.")
+            self.report({"ERROR"}, _iface("Selected object no longer exists."))
             return {"CANCELLED"}
 
         color = tuple(self.color)
 
         group_node = _active_viewer_group_node(context.scene)
         if not group_node or group_node.node_tree.name != self.group_name:
-            self.report({"ERROR"}, "The active Viewer connection changed. Run Change ID again.")
+            self.report(
+                {"ERROR"},
+                _iface("The active Viewer connection changed. Run Change ID again."),
+            )
             return {"CANCELLED"}
 
         input_names = _target_input_names_for_viewer_group(obj, group_node)
         if not input_names:
-            self.report({"ERROR"}, f"No matching {self.group_name} input was found for the selected object.")
+            self.report(
+                {"ERROR"},
+                _iface("No matching {group_name} input was found for the selected object.").format(
+                    group_name=self.group_name
+                ),
+            )
             return {"CANCELLED"}
 
         changed = False
@@ -1518,7 +2744,12 @@ class OBJECTID_OT_change(Operator):
             changed |= _set_group_node_input_color(group_node, input_name, color)
 
         if not changed:
-            self.report({"ERROR"}, f"No editable {self.group_name} input was found for the selected object.")
+            self.report(
+                {"ERROR"},
+                _iface("No editable {group_name} input was found for the selected object.").format(
+                    group_name=self.group_name
+                ),
+            )
             return {"CANCELLED"}
 
         if self.group_name == OBJECT_GROUP_NAME:
@@ -1542,15 +2773,136 @@ class OBJECTID_OT_random(Operator):
         changed_material = _randomize_group_input_colors(context.scene, MATERIAL_GROUP_NAME)
 
         if not changed_object and not changed_material:
-            self.report({"INFO"}, "No ObjectID or Material ID node group with enough colors was found.")
+            self.report(
+                {"INFO"},
+                _iface("No ObjectID or Material ID node group with enough colors was found."),
+            )
             return {"CANCELLED"}
 
         tree = _scene_compositor_tree(context.scene)
         if tree:
             tree.update_tag()
 
-        self.report({"INFO"}, "Random ID colors were reordered.")
+        self.report({"INFO"}, _iface("Random ID colors were reordered."))
         return {"FINISHED"}
+
+
+class OBJECTID_OT_render_id_channel(Operator):
+    bl_idname = "object_id.render_id_channel"
+    bl_label = "Render ID Channel"
+    bl_description = "Temporarily use low-cost parameter to render ID channels without changing project's settings."
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
+
+    def execute(self, context):
+        scene = context.scene
+        if scene.name in render_id_restore_snapshots:
+            self.report({"WARNING"}, _iface("A Render ID Channel render is already running."))
+            return {"CANCELLED"}
+
+        render_id_restore_snapshots[scene.name] = {
+            "view_layer_name": context.view_layer.name,
+            "snapshot": _capture_render_settings(scene, context.view_layer),
+        }
+        preferences = _addon_preferences(context)
+        snapshot = _load_saved_render_settings(preferences)
+        if snapshot is None:
+            _apply_default_render_id_settings(scene)
+        else:
+            _applied, skipped = _apply_render_settings(scene, context.view_layer, snapshot)
+            if skipped:
+                self.report(
+                    {"WARNING"},
+                    _iface("{count} unavailable recorded render settings were skipped.").format(
+                        count=skipped
+                    ),
+                )
+        try:
+            result = bpy.ops.render.render("INVOKE_DEFAULT")
+        except RuntimeError as error:
+            _restore_render_id_project_settings(scene)
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        if "CANCELLED" in result:
+            _restore_render_id_project_settings(scene)
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class _OBJECTID_RenderSettingPopup:
+    action = ""
+
+    def invoke(self, context, _event):
+        return context.window_manager.invoke_props_dialog(
+            self,
+            width=340,
+            title=self.bl_label,
+            confirm_text="Yes",
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        if self.action == "RECORD":
+            layout.label(text="Record the current Render Properties settings?")
+            layout.label(text="This will replace the previously recorded settings.")
+        else:
+            preferences = _addon_preferences(context)
+            if _load_saved_render_settings(preferences) is None:
+                layout.label(text="Load the default low-cost Render ID settings?")
+            else:
+                layout.label(text="Load the last recorded Render Properties settings?")
+            layout.label(text="This will change the current scene render settings.")
+
+    def execute(self, context):
+        preferences = _addon_preferences(context)
+        if preferences is None:
+            self.report({"ERROR"}, _iface("CryptoMatte ID Color preferences are unavailable."))
+            return {"CANCELLED"}
+
+        if self.action == "RECORD":
+            snapshot = _capture_render_settings(context.scene, context.view_layer)
+            preferences.render_id_settings_json = json.dumps(snapshot, separators=(",", ":"))
+            preferences.render_id_recorded_at = time.time()
+            self.report({"INFO"}, _iface("Render ID settings recorded."))
+            return {"FINISHED"}
+
+        snapshot = _load_saved_render_settings(preferences)
+        if snapshot is None:
+            _apply_default_render_id_settings(context.scene)
+            self.report({"INFO"}, _iface("Default Render ID settings loaded."))
+            return {"FINISHED"}
+
+        applied, skipped = _apply_render_settings(context.scene, context.view_layer, snapshot)
+        message = _iface("Loaded {count} recorded Render ID settings.").format(count=applied)
+        if skipped:
+            message += " " + _iface("{count} unavailable settings were skipped.").format(
+                count=skipped
+            )
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class OBJECTID_OT_load_render_setting(_OBJECTID_RenderSettingPopup, Operator):
+    bl_idname = "object_id.load_render_setting"
+    bl_label = "Load Render ID Setting"
+    action = "LOAD"
+
+    @classmethod
+    def description(cls, context, _properties):
+        record_time = _render_setting_record_time(_addon_preferences(context))
+        if record_time == "Default setting":
+            return _tip("Default setting")
+        return _tip("Last recorded: {record_time}").format(record_time=record_time)
+
+
+class OBJECTID_OT_record_render_setting(_OBJECTID_RenderSettingPopup, Operator):
+    bl_idname = "object_id.record_render_setting"
+    bl_label = "Record Render ID Setting"
+    bl_description = "Record the current Render Properties settings for future Render ID Channel renders"
+    action = "RECORD"
 
 
 # --- Preferences and compositor sidebar UI ---
@@ -1558,13 +2910,29 @@ class OBJECTID_OT_random(Operator):
 class CRYPTOMATTE_ID_COLOR_Preferences(AddonPreferences):
     bl_idname = ADDON_PACKAGE
 
+    render_id_settings_json: StringProperty(default="", options={"HIDDEN"})
+    render_id_recorded_at: FloatProperty(default=0.0, options={"HIDDEN"})
+    remembered_settings_initialized: BoolProperty(default=False, options={"HIDDEN"})
+    remembered_use_exr: BoolProperty(default=False, options={"HIDDEN"})
+    remembered_use_psd: BoolProperty(default=False, options={"HIDDEN"})
+    remembered_camera_visible_only: BoolProperty(default=True, options={"HIDDEN"})
+    remembered_low_memory: BoolProperty(default=False, options={"HIDDEN"})
+    remembered_output_path: StringProperty(
+        default=DEFAULT_EXR_OUTPUT_DIR,
+        subtype="DIR_PATH",
+        options={"HIDDEN"},
+    )
+
     def draw_shortcut_cell(self, layout, context, operator_idname, label_text):
         _keyconfig, _keymap, keymap_item = keymap_item_for_operator(context, operator_idname)
         if keymap_item is None:
             sync_keymaps()
             _keyconfig, _keymap, keymap_item = keymap_item_for_operator(context, operator_idname)
         if keymap_item is None:
-            layout.label(text=f"{label_text}: shortcut not found", icon="ERROR")
+            layout.label(
+                text=_iface("{label}: shortcut not found").format(label=_iface(label_text)),
+                icon="ERROR",
+            )
             return
 
         if keymap_item.map_type != "KEYBOARD":
@@ -1586,13 +2954,32 @@ class CRYPTOMATTE_ID_COLOR_Preferences(AddonPreferences):
         info_col.label(text='Edit one color with "Change ID". Randomize colors with "Random ID".')
         layout.separator(factor=0.5)
 
-        for index in range(0, len(SHORTCUT_TARGETS), 2):
-            row = layout.row(align=True)
-            split = row.split(factor=0.5, align=True)
+        for index in range(0, 4, 2):
+            row = layout.row(align=False)
+            split = row.split(factor=0.5, align=False)
             columns = (split.column(align=True), split.column(align=True))
             for target, column in zip(SHORTCUT_TARGETS[index : index + 2], columns):
                 operator_idname, label_text, _key_type, _modifiers = target
                 self.draw_shortcut_cell(column, context, operator_idname, label_text)
+
+        row = layout.row(align=True)
+        split = row.split(factor=0.5, align=True)
+        shortcut_column = split.column(align=True)
+        operator_idname, label_text, _key_type, _modifiers = SHORTCUT_TARGETS[-1]
+        self.draw_shortcut_cell(shortcut_column, context, operator_idname, label_text)
+        button_split = split.split(factor=0.5, align=False)
+        load_button = button_split.column(align=False)
+        record_button = button_split.column(align=False)
+        load_button.operator(
+            "object_id.load_render_setting",
+            text="Load Render ID Setting",
+            emboss=True,
+        )
+        record_button.operator(
+            "object_id.record_render_setting",
+            text="Record Render ID Setting",
+            emboss=True,
+        )
 
 
 class CRYPTOMATTE_ID_COLOR_PT_tools(Panel):
@@ -1620,6 +3007,7 @@ class CRYPTOMATTE_ID_COLOR_PT_tools(Panel):
         split.operator("object_id.random", text="Random ID", icon="FILE_REFRESH")
 
         layout.prop(context.scene, "cryptomatte_camera_visible_only", text="Camera Visible Only")
+        layout.prop(context.scene, "cryptomatte_low_memory", text="Reduce Memory Pressure")
 
         row = layout.row(align=True)
         split = row.split(factor=0.5, align=True)
@@ -1632,6 +3020,7 @@ class CRYPTOMATTE_ID_COLOR_PT_tools(Panel):
         path_row.enabled = context.scene.cryptomatte_use_exr or context.scene.cryptomatte_use_psd
         path_row.prop(context.scene, "cryptomatte_exr_output_path", text="")
 
+        layout.operator("object_id.render_id_channel", text="Render ID Channel", icon="RENDER_STILL")
 
 
 
@@ -1643,11 +3032,15 @@ classes = (
     OBJECTID_OT_create_material,
     OBJECTID_OT_change,
     OBJECTID_OT_random,
+    OBJECTID_OT_render_id_channel,
+    OBJECTID_OT_load_render_setting,
+    OBJECTID_OT_record_render_setting,
     CRYPTOMATTE_ID_COLOR_PT_tools,
 )
 
 
 def register():
+    bpy.app.translations.register(ADDON_PACKAGE, TRANSLATIONS)
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.cryptomatte_use_exr = BoolProperty(
@@ -1665,7 +3058,36 @@ def register():
     bpy.types.Scene.cryptomatte_camera_visible_only = BoolProperty(
         name="Camera Visible Only",
         description="Create ID layers only for objects visible as the first opaque surface from the active camera",
+        default=True,
+        update=update_remembered_scene_settings,
+    )
+    bpy.types.Scene.cryptomatte_low_memory = BoolProperty(
+        name="Reduce Memory Pressure",
+        description="Process one ID layer at a time from Blender's disk render cache to reduce peak compositor memory use",
         default=False,
+        update=update_low_memory_settings,
+    )
+    bpy.types.Scene.cryptomatte_low_memory_previous_compositing = BoolProperty(
+        default=True,
+        options={"HIDDEN"},
+    )
+    bpy.types.Scene.cryptomatte_low_memory_previous_render_cache = BoolProperty(
+        default=False,
+        options={"HIDDEN"},
+    )
+    bpy.types.Scene.cryptomatte_low_memory_override_active = BoolProperty(
+        default=False,
+        options={"HIDDEN"},
+    )
+    bpy.types.Scene.cryptomatte_psd_seconds_per_mp_layer = FloatProperty(
+        default=0.0,
+        min=0.0,
+        options={"HIDDEN"},
+    )
+    bpy.types.Scene.cryptomatte_low_memory_seconds_per_mp_layer = FloatProperty(
+        default=0.0,
+        min=0.0,
+        options={"HIDDEN"},
     )
     bpy.types.Scene.cryptomatte_exr_output_path = StringProperty(
         name="EXR Output Path",
@@ -1674,25 +3096,99 @@ def register():
         subtype="DIR_PATH",
         update=update_exr_output_settings,
     )
+    if prepare_low_memory_render not in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.append(prepare_low_memory_render)
+    if start_low_memory_export not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(start_low_memory_export)
     if export_psd_after_render not in bpy.app.handlers.render_complete:
         bpy.app.handlers.render_complete.append(export_psd_after_render)
+    if restore_render_id_settings_after_render not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(restore_render_id_settings_after_render)
+    if cancel_low_memory_render not in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.append(cancel_low_memory_render)
+    if restore_render_id_settings_after_render not in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.append(restore_render_id_settings_after_render)
     if invalidate_visibility_cache not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(invalidate_visibility_cache)
+    if restore_remembered_scene_settings_after_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(restore_remembered_scene_settings_after_load)
+    if not bpy.app.timers.is_registered(_restore_remembered_scene_settings_timer):
+        bpy.app.timers.register(_restore_remembered_scene_settings_timer, first_interval=0.0)
+    scenes = getattr(bpy.data, "scenes", None)
+    if scenes is not None:
+        for scene in scenes:
+            if getattr(scene, "cryptomatte_low_memory", False):
+                if getattr(scene, "cryptomatte_low_memory_override_active", False):
+                    scene.render.use_compositing = scene.cryptomatte_low_memory_previous_compositing
+                    scene.render.use_render_cache = scene.cryptomatte_low_memory_previous_render_cache
+                    scene.cryptomatte_low_memory_override_active = False
+                _enable_low_memory_scene(scene)
+        sync_exr_outputs(bpy.context)
     sync_keymaps()
 
 
 def unregister():
     unregister_keymaps()
+    if bpy.app.timers.is_registered(_restore_remembered_scene_settings_timer):
+        bpy.app.timers.unregister(_restore_remembered_scene_settings_timer)
+    _end_export_progress()
+    _sync_export_progress_event_timers(False)
+    if bpy.app.timers.is_registered(_progress_redraw_timer):
+        bpy.app.timers.unregister(_progress_redraw_timer)
+    if export_progress["ui_installed"]:
+        _set_export_status_draw(False)
+        export_progress["ui_installed"] = False
+        export_progress["workspace_names"] = ()
+    scenes = getattr(bpy.data, "scenes", None)
+    for scene_name, state in list(low_memory_render_jobs.items()):
+        timer = state.get("timer")
+        if timer is not None and bpy.app.timers.is_registered(timer):
+            bpy.app.timers.unregister(timer)
+        for writer_name in ("exr_writer", "psd_writer"):
+            writer = state.get(writer_name)
+            if writer is not None:
+                writer.abort()
+    low_memory_render_jobs.clear()
+    if scenes is not None:
+        for scene in scenes:
+            _restore_render_id_project_settings(scene)
+        for scene in scenes:
+            _disable_low_memory_scene(scene)
+    render_id_restore_snapshots.clear()
+    while prepare_low_memory_render in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.remove(prepare_low_memory_render)
+    while start_low_memory_export in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.remove(start_low_memory_export)
     while export_psd_after_render in bpy.app.handlers.render_complete:
         bpy.app.handlers.render_complete.remove(export_psd_after_render)
+    while restore_render_id_settings_after_render in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.remove(restore_render_id_settings_after_render)
+    while cancel_low_memory_render in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.remove(cancel_low_memory_render)
+    while restore_render_id_settings_after_render in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.remove(restore_render_id_settings_after_render)
     while invalidate_visibility_cache in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(invalidate_visibility_cache)
-    for prop_name in ("cryptomatte_use_exr", "cryptomatte_use_psd", "cryptomatte_camera_visible_only", "cryptomatte_exr_output_path"):
+    while restore_remembered_scene_settings_after_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(restore_remembered_scene_settings_after_load)
+    for prop_name in (
+        "cryptomatte_use_exr",
+        "cryptomatte_use_psd",
+        "cryptomatte_camera_visible_only",
+        "cryptomatte_low_memory",
+        "cryptomatte_low_memory_previous_compositing",
+        "cryptomatte_low_memory_previous_render_cache",
+        "cryptomatte_low_memory_override_active",
+        "cryptomatte_psd_seconds_per_mp_layer",
+        "cryptomatte_low_memory_seconds_per_mp_layer",
+        "cryptomatte_exr_output_path",
+    ):
         if hasattr(bpy.types.Scene, prop_name):
             delattr(bpy.types.Scene, prop_name)
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    bpy.app.translations.unregister(ADDON_PACKAGE)
 
 
 if __name__ == "__main__":
